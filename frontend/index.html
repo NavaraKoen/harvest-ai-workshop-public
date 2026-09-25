@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Temporal AI Chat</title>
+    <title>Temporal Music Recommender</title>
     <style>
       *,
       *::before,
@@ -471,21 +471,30 @@
   </head>
   <body>
     <header>
-      <h1>⚡ Temporal AI Chat</h1>
-      <button id="btn-new-chat">+ New Chat</button>
+      <h1>♫ Temporal Music Recommender</h1>
+      <div>
+        <button id="btn-stop" disabled>Stop recommendations</button>
+        <button id="btn-new-chat">Start / reconnect</button>
+      </div>
     </header>
 
     <div id="chat-wrapper">
+      <div style="padding: 14px 20px; border-bottom: 1px solid #eee; font-size: .85rem">
+        Spotify + preferences → LLM → song → Slack → feedback → preferences<br />
+        Negative feedback makes the bot double down: stronger dislike → more of that style.<br />
+        <strong id="workflow-status">Runs every minute after you start.</strong>
+        <p id="preferences" style="margin-top: 8px; color: #555"></p>
+      </div>
       <div id="tab-bar">
-        <button class="tab-btn active" data-tab="chat">Chat</button>
+        <button class="tab-btn active" data-tab="chat">Recommendations</button>
         <button class="tab-btn" data-tab="llm-log">LLM Log</button>
         <button class="tab-btn" data-tab="llm-raw-log">Raw LLM Log</button>
       </div>
 
       <div id="messages">
         <div id="empty-state">
-          <div class="icon">💬</div>
-          <p>Click <strong>New Chat</strong> to start a conversation.</p>
+          <div class="icon">♫</div>
+          <p>Start recommendations, then share your music preferences here<br />or reply to a song’s Slack thread.</p>
         </div>
         <div id="typing"><span></span><span></span><span></span></div>
       </div>
@@ -510,13 +519,13 @@
         <textarea
           id="user-input"
           rows="1"
-          placeholder="Type your message…"
+          placeholder="Share your taste or feedback on the latest song…"
         ></textarea>
         <button id="btn-send">Send</button>
       </div>
 
       <div id="ended-notice">
-        Chat session has ended. Start a new chat to continue.
+        Recommendations stopped. Start again to begin a new session.
       </div>
       <div id="failed-notice"></div>
     </div>
@@ -530,6 +539,8 @@
       let lastHistoryLen = 0;
       let currentState = null;
       let currentError = null;
+      let previousHistory = [];
+      const elBtnStop = document.getElementById("btn-stop");
 
       // ── DOM refs ──────────────────────────────────────────────────────────────
       const elMessages = document.getElementById("messages");
@@ -696,13 +707,16 @@
           if (!res.ok) return;
           const data = await res.json();
           const entries = data.entries ?? [];
-          for (let i = lastLogLen; i < entries.length; i++) {
-            elLlmLogPanel.appendChild(renderLogEntry(entries[i]));
-            elLlmRawLogPanel.appendChild(renderRawLogEntry(entries[i]));
+          for (const entry of entries.filter((e) => e.call > lastLogLen)) {
+            elLlmLogPanel.appendChild(renderLogEntry(entry));
+            elLlmRawLogPanel.appendChild(renderRawLogEntry(entry));
+            lastLogLen = entry.call;
             elLlmLogPanel.scrollTop = elLlmLogPanel.scrollHeight;
             elLlmRawLogPanel.scrollTop = elLlmRawLogPanel.scrollHeight;
           }
-          lastLogLen = entries.length;
+          for (const panel of [elLlmLogPanel, elLlmRawLogPanel]) {
+            while (panel.children.length > 30) panel.firstElementChild.remove();
+          }
         } catch (e) {
           /* swallow */
         }
@@ -768,10 +782,13 @@
         elConfirmBar.style.display = "none";
         elEndedNotice.style.display = "none";
         elFailedNotice.style.display = "none";
+        elBtnStop.disabled = !workflowId || state === "ended" || state === "failed";
+        document.getElementById("workflow-status").textContent =
+          state === "waiting_interval" ? "Next recommendation on the one-minute tick. Feedback is welcome anytime." :
+          state === "running" ? "Choosing your next song…" : state;
 
-        if (state === "waiting_input") {
+        if (["waiting_input", "waiting_interval", "running", "starting"].includes(state)) {
           elInputBar.style.display = "flex";
-          elUserInput.focus();
         } else if (state === "waiting_confirmation") {
           elConfirmBar.style.display = "flex";
         } else if (state === "ended") {
@@ -795,6 +812,8 @@
           const res = await fetch(`${API}/api/chat/${workflowId}/state`);
           if (!res.ok) return;
           const data = await res.json();
+          document.getElementById("preferences").textContent =
+            data.preferences ? `Recommendation profile: ${data.preferences}` : "";
 
           if (data.state === "failed") {
             currentError = data.error;
@@ -808,6 +827,10 @@
 
           // Render new history entries (skip internal markers and tool results)
           const entries = data.history ?? [];
+          if (previousHistory.length && JSON.stringify(entries.slice(0, previousHistory.length)) !== JSON.stringify(previousHistory)) {
+            elMessages.querySelectorAll(".msg").forEach((el) => el.remove());
+            lastHistoryLen = 0;
+          }
           for (let i = lastHistoryLen; i < entries.length; i++) {
             const { role, content } = entries[i];
             if (content === "[CHAT_START]") continue;
@@ -815,6 +838,7 @@
             addMessage(role, content);
           }
           lastHistoryLen = entries.length;
+          previousHistory = entries;
 
           // Update confirmation bar when tool approval is pending
           if (data.pending_tool) {
@@ -852,9 +876,11 @@
 
       // ── Start new chat ────────────────────────────────────────────────────────
       elBtnNewChat.addEventListener("click", async () => {
+        elBtnNewChat.disabled = true;
         stopPolling();
         workflowId = null;
         lastHistoryLen = 0;
+        previousHistory = [];
         lastLogLen = 0;
         currentState = null;
         currentError = null;
@@ -885,11 +911,26 @@
         try {
           const res = await fetch(`${API}/api/chat/start`, { method: "POST" });
           const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || "Could not start recommendations");
           workflowId = data.workflow_id;
           startPolling();
         } catch (e) {
           showTyping(false);
-          addMessage("system", "⚠ Could not reach the API. Is it running?");
+          addMessage("system", `⚠ ${e.message}`);
+        } finally {
+          elBtnNewChat.disabled = false;
+        }
+      });
+
+      elBtnStop.addEventListener("click", async () => {
+        if (!workflowId) return;
+        elBtnStop.disabled = true;
+        try {
+          const res = await fetch(`${API}/api/chat/${workflowId}/stop`, { method: "POST" });
+          if (!res.ok) throw new Error("Could not stop recommendations");
+        } catch (e) {
+          addMessage("system", e.message);
+          elBtnStop.disabled = false;
         }
       });
 
@@ -908,11 +949,15 @@
         currentState = null;
 
         try {
-          await fetch(`${API}/api/chat/${workflowId}/input`, {
+          const res = await fetch(`${API}/api/chat/${workflowId}/input`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ message: text }),
           });
+          if (!res.ok) throw new Error("Could not send feedback");
+        } catch (e) {
+          elUserInput.value = text;
+          addMessage("system", e.message);
         } finally {
           elBtnSend.disabled = false;
         }
