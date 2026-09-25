@@ -1,19 +1,24 @@
 import os
 import sys
-import uuid
+import hashlib
+import hmac
+import json
+import time
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from temporalio.client import Client, WorkflowExecutionStatus
+from temporalio.common import WorkflowIDConflictPolicy
 from temporalio.service import RPCError
 
 from api.services import router as services_router
 from temporal_app.workflows.chat import ChatWorkflow
+from temporal_app.workflows.music import MusicWorkflow
 
 load_dotenv()
 
@@ -21,7 +26,7 @@ TEMPORAL_HOST = os.getenv("TEMPORAL_HOST", "localhost:7233")
 TASK_QUEUE = "chat-task-queue"
 FRONTEND_DIR = os.path.join(os.path.dirname(__file__), "..", "frontend")
 
-app = FastAPI(title="Temporal Chat API", version="0.1.0")
+app = FastAPI(title="Temporal Music Recommendations", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -45,8 +50,12 @@ class StartChatResponse(BaseModel):
     workflow_id: str
 
 
+class StartMusicRequest(BaseModel):
+    preferences: str = Field(default="", max_length=2000)
+
+
 class UserInputRequest(BaseModel):
-    message: str
+    message: str = Field(min_length=1, max_length=4000)
 
 
 class ConfirmationRequest(BaseModel):
@@ -55,6 +64,7 @@ class ConfirmationRequest(BaseModel):
 
 class ChatStateResponse(BaseModel):
     state: str
+    preferences: Optional[str] = None
     pending_tool: Optional[str] = None
     pending_tool_args: Optional[Dict[str, Any]] = None
     history: List[Dict[str, Any]] = []
@@ -66,17 +76,20 @@ class ChatStateResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 @app.post("/api/chat/start", response_model=StartChatResponse)
-async def start_chat() -> StartChatResponse:
-    """Start a new ChatWorkflow and return its ID."""
+async def start_chat(body: StartMusicRequest | None = None) -> StartChatResponse:
+    """Start or reconnect to the music loop for the configured Slack channel."""
+    channel = os.getenv("SLACK_CHANNEL_ID", "").strip()
+    if not channel:
+        raise HTTPException(status_code=400, detail="Set SLACK_CHANNEL_ID in .env first")
     client = await _client()
-    workflow_id = f"chat-{uuid.uuid4()}"
-    require_confirmation = os.getenv("CONFIRMATION", "true").lower() != "false"
+    workflow_id = f"music-{channel}"
     no_retries = os.getenv("NO_RETRIES", "false").lower() == "true"
     await client.start_workflow(
-        ChatWorkflow.run,
-        args=["[CHAT_START]", require_confirmation, no_retries],
+        MusicWorkflow.run,
+        args=[channel, body.preferences if body else "", no_retries],
         id=workflow_id,
         task_queue=TASK_QUEUE,
+        id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
     )
     return StartChatResponse(workflow_id=workflow_id)
 
@@ -87,10 +100,51 @@ async def send_input(workflow_id: str, body: UserInputRequest) -> Dict:
     client = await _client()
     handle = client.get_workflow_handle(workflow_id)
     try:
-        await handle.signal(ChatWorkflow.send_user_input, body.message)
+        await handle.signal("send_user_input", body.message)
     except RPCError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"status": "ok"}
+
+
+@app.post("/api/chat/{workflow_id}/stop")
+async def stop_music(workflow_id: str) -> Dict:
+    client = await _client()
+    try:
+        await client.get_workflow_handle(workflow_id).signal(MusicWorkflow.stop)
+    except RPCError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"status": "ok"}
+
+
+@app.post("/api/slack/events")
+async def slack_events(request: Request) -> Dict:
+    """Verify Slack's signature and durably queue human thread replies as feedback."""
+    secret = os.getenv("SLACK_SIGNING_SECRET", "")
+    if not secret:
+        raise HTTPException(status_code=503, detail="Set SLACK_SIGNING_SECRET")
+    raw = await request.body()
+    timestamp = request.headers.get("x-slack-request-timestamp", "")
+    try:
+        fresh = abs(time.time() - int(timestamp)) <= 300
+    except ValueError:
+        fresh = False
+    expected = "v0=" + hmac.new(secret.encode(), b"v0:" + timestamp.encode() + b":" + raw,
+                                 hashlib.sha256).hexdigest()
+    if not fresh or not hmac.compare_digest(expected, request.headers.get("x-slack-signature", "")):
+        raise HTTPException(status_code=401, detail="Invalid Slack signature")
+    payload = json.loads(raw)
+    if payload.get("type") == "url_verification":
+        return {"challenge": payload["challenge"]}
+    event = payload.get("event", {})
+    channel = os.getenv("SLACK_CHANNEL_ID", "").strip()
+    if (event.get("type") == "message" and event.get("channel") == channel
+            and event.get("thread_ts") and event.get("text") and event.get("user")
+            and not event.get("bot_id") and not event.get("subtype")):
+        client = await _client()
+        await client.get_workflow_handle(f"music-{channel}").signal(MusicWorkflow.slack_feedback, {
+            "event_id": payload["event_id"], "thread_ts": event["thread_ts"], "text": event["text"],
+        })
+    return {"ok": True}
 
 
 @app.post("/api/chat/{workflow_id}/confirm")
@@ -112,17 +166,19 @@ async def get_state(workflow_id: str) -> ChatStateResponse:
     handle = client.get_workflow_handle(workflow_id)
     try:
         description = await handle.describe()
-        if description.status == WorkflowExecutionStatus.FAILED:
+        if description.status in {WorkflowExecutionStatus.FAILED, WorkflowExecutionStatus.TIMED_OUT,
+                                  WorkflowExecutionStatus.TERMINATED, WorkflowExecutionStatus.CANCELED}:
             return ChatStateResponse(
                 state="failed",
-                error="The chat workflow failed. Check the worker logs for details.",
+                error=f"Workflow {description.status.name.lower()}. Check the worker logs for details.",
             )
-        state_dict = await handle.query(ChatWorkflow.get_state)
-        history = await handle.query(ChatWorkflow.get_history)
+        state_dict = await handle.query("get_state")
+        history = await handle.query("get_history")
     except RPCError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return ChatStateResponse(
         state=state_dict["state"],
+        preferences=state_dict.get("preferences"),
         pending_tool=state_dict.get("pending_tool"),
         pending_tool_args=state_dict.get("pending_tool_args"),
         history=history,
@@ -135,7 +191,7 @@ async def get_llm_log(workflow_id: str) -> Dict:
     client = await _client()
     handle = client.get_workflow_handle(workflow_id)
     try:
-        log = await handle.query(ChatWorkflow.get_llm_log)
+        log = await handle.query("get_llm_log")
     except RPCError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {"entries": log}
