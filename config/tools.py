@@ -23,44 +23,38 @@ class ToolDefinition:
 # Async HTTP handlers — each delegates to the /services/* API endpoints
 # ---------------------------------------------------------------------------
 
-async def _search_flights(origin: str, destination: str, month: str) -> str:
+async def _search_tracks(query: str) -> str:
     async with httpx.AsyncClient(timeout=15.0) as client:
         r = await client.post(
-            f"{_SERVICES_BASE_URL}/services/search-flights",
-            json={"origin": origin, "destination": destination, "month": month},
+            f"{_SERVICES_BASE_URL}/services/search-tracks",
+            json={"query": query},
         )
         r.raise_for_status()
         return json.dumps(r.json())
 
 
-async def _select_hotel(city: str, month: str, max_budget_per_night_eur: int = 200) -> str:
+async def _get_recommendations(genre: str = "", mood: str = "", limit: int = 5) -> str:
     async with httpx.AsyncClient(timeout=15.0) as client:
         r = await client.post(
-            f"{_SERVICES_BASE_URL}/services/select-hotel",
-            json={"city": city, "month": month, "max_budget_per_night_eur": max_budget_per_night_eur},
+            f"{_SERVICES_BASE_URL}/services/get-recommendations",
+            json={"genre": genre, "mood": mood, "limit": limit},
         )
         r.raise_for_status()
         return json.dumps(r.json())
 
 
-async def _book_flight(
-    flight_id: str,
-    passenger_name: str,
-    origin: str,
-    destination: str,
-    month: str,
-    hotel_name: str = "",
+async def _create_playlist(
+    playlist_name: str,
+    tracks: Optional[list] = None,
+    user_name: str = "",
 ) -> str:
     async with httpx.AsyncClient(timeout=15.0) as client:
         r = await client.post(
-            f"{_SERVICES_BASE_URL}/services/book-flight",
+            f"{_SERVICES_BASE_URL}/services/create-playlist",
             json={
-                "flight_id": flight_id,
-                "passenger_name": passenger_name,
-                "origin": origin,
-                "destination": destination,
-                "month": month,
-                "hotel_name": hotel_name,
+                "playlist_name": playlist_name,
+                "tracks": tracks or [],
+                "user_name": user_name,
             },
         )
         r.raise_for_status()
@@ -78,40 +72,35 @@ TOOLS: Dict[str, ToolDefinition] = {
         parameters={},
         require_confirmation=False,
     ),
-    "search_flights": ToolDefinition(
-        name="search_flights",
-        description="Search for available flights between two cities in a given month. Make sure to ask the user for both the departure and the destination city.",
+    "search_tracks": ToolDefinition(
+        name="search_tracks",
+        description="Search the Audius music catalog for tracks by song title or artist name. Returns real, playable Audius track links.",
         parameters={
-            "origin":      {"type": "string", "description": "Departure city"},
-            "destination": {"type": "string", "description": "Destination city"},
-            "month":       {"type": "string", "description": "Travel month"},
+            "query": {"type": "string", "description": "Song title or artist to search for"},
         },
         require_confirmation=False,
-        handler=_search_flights,
+        handler=_search_tracks,
     ),
-    "select_hotel": ToolDefinition(
-        name="select_hotel",
-        description="Find available hotels in the destination city filtered by budget.",
+    "get_recommendations": ToolDefinition(
+        name="get_recommendations",
+        description="Get trending track recommendations from Audius for a given genre and/or mood. Example genres: pop, rock, hip-hop, electronic, lo-fi, jazz, classical, country, r&b, latin. Example moods: happy, energetic, party, chill, relaxed, focus, sad, romantic.",
         parameters={
-            "city":                    {"type": "string",  "description": "Destination city"},
-            "month":                   {"type": "string",  "description": "Travel month"},
-            "max_budget_per_night_eur": {"type": "integer", "description": "Maximum price per night in EUR"},
+            "genre": {"type": "string", "description": "Music genre to seed recommendations (optional)"},
+            "mood":  {"type": "string", "description": "Desired mood/vibe (optional)"},
+            "limit": {"type": "integer", "description": "Number of tracks to return (1-10, default 5)"},
         },
         require_confirmation=False,
-        handler=_select_hotel,
+        handler=_get_recommendations,
     ),
-    "book_flight": ToolDefinition(
-        name="book_flight",
-        description="Confirm and book a selected flight (and optionally a hotel).",
+    "create_playlist": ToolDefinition(
+        name="create_playlist",
+        description="Build a shareable, curated list of real Audius track links from a list of selected track titles.",
         parameters={
-            "flight_id":      {"type": "string", "description": "Flight ID from search_flights result"},
-            "passenger_name": {"type": "string", "description": "Full name of the passenger"},
-            "origin":         {"type": "string", "description": "Departure city"},
-            "destination":    {"type": "string", "description": "Destination city"},
-            "month":          {"type": "string", "description": "Travel month"},
-            "hotel_name":     {"type": "string", "description": "Hotel name to include in booking (optional, use empty string if none)"},
+            "playlist_name": {"type": "string", "description": "Name for the new playlist"},
+            "tracks":        {"type": "array",  "description": "List of track titles to add to the playlist"},
+            "user_name":     {"type": "string", "description": "Name of the user who owns the playlist (optional, use empty string if unknown)"},
         },
         require_confirmation=True,
-        handler=_book_flight,
+        handler=_create_playlist,
     ),
 }
